@@ -129,7 +129,9 @@ def evaluate(config, args, test_en, test_de, test_y, test_id, criterion, formatt
                  d_k=d_k, d_v=d_k, n_heads=n_heads,
                  n_layers=stack_size, src_pad_index=0,
                  tgt_pad_index=0, device=device,
-                 attn_type=args.attn_type, seed=args.seed, kernel=kernel).to(device)
+                 attn_type=args.attn_type,
+                 seed=args.seed,
+                 kernel=kernel).to(device)
 
     checkpoint = torch.load(os.path.join(path, "{}_{}".format(args.name, args.seed)))
     model.load_state_dict(checkpoint["model_state_dict"])
@@ -140,16 +142,18 @@ def evaluate(config, args, test_en, test_de, test_y, test_id, criterion, formatt
     targets_all = torch.zeros(test_y.shape[0], test_y.shape[1], test_y.shape[2])
 
     for j in range(test_en.shape[0]):
+
         output = model(test_en[j], test_de[j])
         output_map = inverse_output(output, test_y[j], test_id[j])
-        forecast = torch.from_numpy(extract_numerical_data(
-            formatter.format_predictions(output_map["predictions"])).to_numpy().astype('float32')).to(device)
+        p = formatter.format_predictions(output_map["predictions"])
+        if p is not None:
+            forecast = torch.from_numpy(extract_numerical_data(p).to_numpy().astype('float32')).to(device)
 
-        predictions[j, :, :] = forecast
-        targets = torch.from_numpy(extract_numerical_data(
-            formatter.format_predictions(output_map["targets"])).to_numpy().astype('float32')).to(device)
+            predictions[j, :forecast.shape[0], :] = forecast
+            targets = torch.from_numpy(extract_numerical_data(
+                formatter.format_predictions(output_map["targets"])).to_numpy().astype('float32')).to(device)
 
-        targets_all[j, :, :] = targets
+            targets_all[j, :targets.shape[0], :] = targets
 
     test_loss = criterion(predictions.to(device), targets_all.to(device)).item()
     normaliser = targets_all.to(device).abs().mean()
@@ -170,7 +174,7 @@ def main():
     parser.add_argument("--exp_name", type=str, default='electricity')
     parser.add_argument("--cuda", type=str, default="cuda:0")
     parser.add_argument("--seed", type=int, default=21)
-    parser.add_argument("--total_time_steps", type=int, default=192)
+    parser.add_argument("--total_time_steps", type=int, default=264)
     args = parser.parse_args()
 
     np.random.seed(args.seed)
@@ -222,17 +226,15 @@ def main():
         os.makedirs(path)
 
     criterion = nn.MSELoss()
-    if args.attn_type == "basic_attn":
-        model_params['stack_size'] = [1, 3]
-
     if args.attn_type == "conv_attn":
-        kernels = [1, 3, 6, 9]
+        kernel = [1, 3, 6, 9]
     else:
-        kernels = [1]
+        kernel = [1]
+
     hyper_param = list([model_params['stack_size'],
                         [model_params['num_heads']],
                         model_params['hidden_layer_size'],
-                        kernels])
+                        kernel])
     configs = create_config(hyper_param)
     print('number of config: {}'.format(len(configs)))
 
@@ -264,10 +266,11 @@ def main():
                      d_k=d_k, d_v=d_k, n_heads=n_heads,
                      n_layers=stack_size, src_pad_index=0,
                      tgt_pad_index=0, device=device,
-                     attn_type=args.attn_type, seed=args.seed, kernel=kernel)
+                     attn_type=args.attn_type,
+                     seed=args.seed, kernel=kernel)
         model.to(device)
 
-        optim = NoamOpt(Adam(model.parameters(), lr=0, betas=(0.9, 0.98), eps=1e-9), 2, d_model, 4000)
+        optim = NoamOpt(Adam(model.parameters(), lr=0, betas=(0.9, 0.98), eps=1e-9), 2, d_model, 5000)
 
         epoch_start = 0
 
@@ -276,7 +279,6 @@ def main():
 
         for epoch in range(epoch_start, params['num_epochs'], 1):
 
-            model.train()
             best_config, val_loss, val_inner_loss, stop, e = \
                 train(args, model, train_en_p.to(device), train_de_p.to(device),
                       train_y_p.to(device), valid_en_p.to(device), valid_de_p.to(device),
@@ -285,6 +287,8 @@ def main():
 
             if stop:
                 break
+        print("val loss: {:.4f}".format(val_inner_loss))
+        del model
 
         print("best config so far: {}".format(best_config))
 
@@ -295,13 +299,13 @@ def main():
     stack_size, heads, d_model, kernel = best_config
     print("best_config: {}".format(best_config))
 
-    erros[args.name] = list()
-    config_file[args.name] = list()
-    erros[args.name].append(float("{:.5f}".format(test_loss)))
-    erros[args.name].append(float("{:.5f}".format(mae_loss)))
-    config_file[args.name] = list()
-    config_file[args.name].append(heads)
-    config_file[args.name].append(d_model)
+    erros["{}_{}".format(args.name, args.seed)] = list()
+    config_file["{}_{}".format(args.name, args.seed)] = list()
+    erros["{}_{}".format(args.name, args.seed)].append(float("{:.5f}".format(test_loss)))
+    erros["{}_{}".format(args.name, args.seed)].append(float("{:.5f}".format(mae_loss)))
+    config_file["{}_{}".format(args.name, args.seed)] = list()
+    config_file["{}_{}".format(args.name, args.seed)].append(heads)
+    config_file["{}_{}".format(args.name, args.seed)].append(d_model)
 
     print("test error for best config {:.4f}".format(test_loss))
     error_path = "errors_{}_{}.json".format(args.exp_name, seq_len)
@@ -310,10 +314,10 @@ def main():
     if os.path.exists(error_path):
         with open(error_path) as json_file:
             json_dat = json.load(json_file)
-            if json_dat.get(args.name) is None:
-                json_dat[args.name] = list()
-            json_dat[args.name].append(float("{:.5f}".format(test_loss)))
-            json_dat[args.name].append(float("{:.5f}".format(mae_loss)))
+            if json_dat.get("{}_{}".format(args.name, args.seed)) is None:
+                json_dat["{}_{}".format(args.name, args.seed)] = list()
+            json_dat["{}_{}".format(args.name, args.seed)].append(float("{:.5f}".format(test_loss)))
+            json_dat["{}_{}".format(args.name, args.seed)].append(float("{:.5f}".format(mae_loss)))
 
         with open(error_path, "w") as json_file:
             json.dump(json_dat, json_file)
@@ -324,10 +328,10 @@ def main():
     if os.path.exists(config_path):
         with open(config_path) as json_file:
             json_dat = json.load(json_file)
-            if json_dat.get(args.name) is None:
-                json_dat[args.name] = list()
-            json_dat[args.name].append(heads)
-            json_dat[args.name].append(d_model)
+            if json_dat.get("{}_{}".format(args.name, args.seed)) is None:
+                json_dat["{}_{}".format(args.name, args.seed)] = list()
+            json_dat["{}_{}".format(args.name, args.seed)].append(heads)
+            json_dat["{}_{}".format(args.name, args.seed)].append(d_model)
 
         with open(config_path, "w") as json_file:
             json.dump(json_dat, json_file)
