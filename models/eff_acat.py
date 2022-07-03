@@ -289,32 +289,30 @@ class BasicAttn(nn.Module):
 
 class ACAT(nn.Module):
 
-    def __init__(self, d_k, device, h):
+    def __init__(self, d_k, device, h, l_k):
 
         super(ACAT, self).__init__()
 
         self.device = device
         self.d_k = d_k
-        self.filter_length = [1, 3, 6, 9]
+        self.log_l_k = int(math.log2(l_k))
+        interval = 2 if int(self.log_l_k / 5) < 2 else math.ceil(self.log_l_k / 5)
+        self.filter_length = [int((2 ** (self.log_l_k - i))) for i in range(0, self.log_l_k, interval)]
+        self.filter_length = self.filter_length[1:] if len(self.filter_length) > 2 else self.filter_length
         self.conv_list_q = nn.ModuleList(
-            [nn.Conv1d(in_channels=d_k * h, out_channels=d_k * h,
+            [nn.Conv1d(in_channels=d_k * h, out_channels=d_k*h,
                        kernel_size=f,
                        padding=int(f / 2),
                        bias=False) for f in self.filter_length]).to(device)
         self.conv_list_k = nn.ModuleList(
-            [nn.Conv1d(in_channels=d_k * h, out_channels=d_k * h,
+            [nn.Conv1d(in_channels=d_k * h, out_channels=d_k*h,
                        kernel_size=f,
                        padding=int(f / 2),
                        bias=False) for f in self.filter_length]).to(device)
-        self.norm = nn.BatchNorm1d(h * d_k).to(device)
-        self.activation = nn.ELU().to(device)
-        self.w_f_q = nn.Parameter(torch.randn(h*d_k, h*d_k, len(self.filter_length), device=self.device, requires_grad=True))
-        self.w_f_k = nn.Parameter(
-            torch.randn(h * d_k, h * d_k, len(self.filter_length), device=self.device, requires_grad=True))
 
-        for m in self.modules():
-            if isinstance(m, nn.Conv1d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='leaky_relu')
+        self.norm = nn.BatchNorm1d(d_k*h).to(device)
+        self.activation = nn.ELU()
+        self.factor = 1
 
     def forward(self, Q, K, V, attn_mask):
 
@@ -325,23 +323,31 @@ class ACAT(nn.Module):
                for i in range(len(self.filter_length))]
         K_l = [self.activation(self.norm(self.conv_list_k[i](K.reshape(b, h * d_k, l_k))))[:, :, :l_k]
                for i in range(len(self.filter_length))]
-        Q_p = torch.cat(Q_l, dim=0).reshape(b, h*d_k, l, -1)
-        K_p = torch.cat(K_l, dim=0).reshape(b, h*d_k, l_k, -1)
 
-        Q = torch.max(torch.einsum('bdlf, dof-> bolf', Q_p, self.w_f_q), dim=-1)[0]
-        K = torch.max(torch.einsum('bdlf, dof-> bolf', K_p, self.w_f_k), dim=-1)[0]
-        Q = Q.reshape(b, h, l, -1)
-        K = K.reshape(b, h, l_k, -1)
+        Q_p = torch.cat(Q_l, dim=0).reshape(b, l*len(self.filter_length), -1)
+        K_p = torch.cat(K_l, dim=0).reshape(b, len(self.filter_length), l_k, -1)
+        Q = torch.topk(Q_p, l, dim=1)[0]
+        Q = Q.reshape(b, h, l, d_k)
+        K = torch.mean(K_p, dim=1)
+        K = K.reshape(b, h, l_k, d_k)
 
+        K, index = torch.topk(K, self.log_l_k*self.factor, dim=-2)
+        index = index[:, :, :, 0]
+        index = index.unsqueeze(-2).repeat(1, 1, l, 1)
         scores = torch.einsum('bhqd,bhkd->bhqk', Q, K) / np.sqrt(self.d_k)
 
         if attn_mask is not None:
-
+            attn_mask = attn_mask[:, :, :, :self.log_l_k*self.factor]
             attn_mask = torch.as_tensor(attn_mask, dtype=torch.bool)
             attn_mask = attn_mask.to(self.device)
             scores.masked_fill_(attn_mask, -1e9)
 
-        attn = torch.softmax(scores, -1)
+        scores_f = torch.zeros(b, h, l, l_k, device=self.device)
+        scores_f[torch.arange(b)[:, None, None, None],
+                 torch.arange(h)[None, :, None, None],
+                 torch.arange(l)[None, None, :, None], index] = scores
+
+        attn = torch.softmax(scores_f, -1)
         context = torch.einsum('bhqk,bhkd->bhqd', attn, V)
         return context, attn
 
@@ -376,7 +382,7 @@ class MultiHeadAttention(nn.Module):
         if attn_mask is not None:
             attn_mask = attn_mask.unsqueeze(1).repeat(1, self.n_heads, 1, 1)
         if self.attn_type == "ACAT":
-            context, attn = ACAT(d_k=self.d_k, device=self.device, h=self.n_heads)(
+            context, attn = ACAT(d_k=self.d_k, device=self.device, h=self.n_heads, l_k=k_s.shape[2])(
                 Q=q_s, K=k_s, V=v_s, attn_mask=attn_mask)
         elif self.attn_type == "basic_attn":
             context, attn = BasicAttn(d_k=self.d_k, device=self.device)(
@@ -565,7 +571,7 @@ class Attn(nn.Module):
         self.decoder = Decoder(
             d_model=d_model, d_ff=d_ff,
             d_k=d_k, d_v=d_v, n_heads=n_heads,
-            n_layers=1, pad_index=tgt_pad_index,
+            n_layers=n_layers, pad_index=tgt_pad_index,
             device=device,
             attn_type=attn_type, kernel=kernel)
 
